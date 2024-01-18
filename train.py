@@ -14,42 +14,49 @@ from transformers import BertTokenizer
 
 TITLES_TO_CATEGORIES_CSV = './titles_to_categories.csv'
 max_title_token_length = 50
+sample_frac = 0.01
 
+OOV_TOKEN_ID = 1
 
-# def get_input_tensor(df, seq_len, vocab):
-#     df = df.reset_index(drop=True)
-#     data_tensor = torch.zeros((len(df), seq_len), dtype=torch.long)
-#     for i, row in df.iterrows():
-#         title = row["tokenized_title"]
-#         title = title[:seq_len]
-#         padded_title = title + ["[PAD]"] * (seq_len - len(title))
-#         for j, token in enumerate(padded_title):
-#             data_tensor[i][j] = vocab[token]
-#     return data_tensor
+def get_input_tensor(df, seq_len, vocab):
+    df = df.reset_index(drop=True)
+    data_tensor = torch.zeros((len(df), seq_len), dtype=torch.long)
+    for i, row in df.iterrows():
+        title = row["tokenized_title"]
+        title = title[:seq_len]
+        padded_title = title + ["[PAD]"] * (seq_len - len(title))
+        for j, token in enumerate(padded_title):
+            data_tensor[i][j] = vocab.get(token, OOV_TOKEN_ID)
+    return data_tensor
 
-def process_chunk(sub_df, seq_len, vocab):
+def process_chunk(sub_df, seq_len, vocab, debug_index=0):
+    # logging.info(f"Process {debug_index} starting ..")
     sub_data_tensor = torch.zeros((len(sub_df), seq_len), dtype=torch.long)
     for i, row in enumerate(sub_df.itertuples(index=False)):
         title = row.tokenized_title[:seq_len]
         padded_title = title + ["[PAD]"] * (seq_len - len(title))
         for j, token in enumerate(padded_title):
-            sub_data_tensor[i][j] = vocab[token]
+            sub_data_tensor[i][j] = vocab.get(token, OOV_TOKEN_ID)
+    # logging.info(f"Process {debug_index} finished")
     return sub_data_tensor
 
+#def debug_process_chunk(sub_df_len, seq_len, vocab, debug_index):
+#    logging.info(f"Process {debug_index} starting ..")
+#    sub_data_tensor = torch.zeros((sub_df_len, seq_len), dtype=torch.long)
+#    logging.info(f"Process {debug_index} finished")
+#    return sub_data_tensor
 
-def get_input_tensor(df, seq_len, vocab, num_cores=96):
+
+def distributed_get_input_tensor(df, seq_len, vocab, num_cores=96):
     df = df.reset_index(drop=True)
     # Split DataFrame into chunks
     chunk_size = len(df) // num_cores
     chunks = [df.iloc[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
 
     logging.info("Starting pool ..")
-    # Create a pool of worker processes
-    with Pool(processes=num_cores) as pool:
-        # Distribute the work to the worker processes
-        results = pool.starmap(process_chunk, [(chunk, seq_len, vocab) for chunk in chunks])
-
-    # Merge the results
+    with Pool(num_cores) as pool:
+        results = pool.starmap(process_chunk, [(chunk, seq_len, vocab, i) for i, chunk in enumerate(chunks)])
+    del pool
     data_tensor = torch.cat(results, dim=0)
 
     return data_tensor
@@ -95,13 +102,14 @@ def load_data(input_csv, sample_frac=0.1):
 
     return train_df, test_df, categories
 
-def get_vocab(df):
+def get_vocab(df, min_count=10):
     vocab_counts = defaultdict(lambda: 0)
     for tokenized_title in df["tokenized_title"]:
         for token in tokenized_title:
             vocab_counts[token] += 1
-    tokens_by_count = sorted([(v, i) for v, i in vocab_counts.items()], key=lambda x: x[1], reverse=True)
-    tokens_by_count = [('[PAD]', 0)] + tokens_by_count  # 0 is reserved for padding
+    token_counts = [(v, i) for v, i in vocab_counts.items() if i >= min_count]
+    tokens_by_count = sorted(token_counts, key=lambda x: x[1], reverse=True)
+    tokens_by_count = [('[PAD]', 0), ('[OOV]', 0)] + tokens_by_count
     vocab = {token: i for i, (token, _) in enumerate(tokens_by_count)}
     logging.info(f"Vocab items {len(vocab)}")
     return vocab
@@ -174,14 +182,14 @@ def eval(model, input_tensor, label_tensor):
 
 def main(_):
     logging.info("----------- Load data -----------")
-    train_df, test_df, categories = load_data(TITLES_TO_CATEGORIES_CSV)
+    train_df, test_df, categories = load_data(TITLES_TO_CATEGORIES_CSV, sample_frac)
     vocab = get_vocab(train_df)
     logging.info("Preparing train input tensor ...")
-    train_input_tensor = get_input_tensor(train_df, max_title_token_length, vocab)
+    train_input_tensor = distributed_get_input_tensor(train_df, max_title_token_length, vocab)
     logging.info("Preparing train label tensor ...")
     train_label_tensor = get_label_tensor(train_df)
     logging.info("Preparing test input tensor ...")
-    test_input_tensor = get_input_tensor(test_df, max_title_token_length, vocab)
+    test_input_tensor = get_input_tensor(test_df, max_title_token_length, vocab,)
     logging.info("Preparing test label tensor ...")
     test_label_tensor = get_label_tensor(test_df)
 
@@ -234,5 +242,5 @@ def main(_):
 
 
 if __name__ == "__main__":
-    main(None)
+    app.run(main)
     
