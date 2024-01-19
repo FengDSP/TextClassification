@@ -14,7 +14,6 @@ from multiprocessing import Pool
 
 from transformers import BertTokenizer
 
-random_input = False
 TITLES_TO_CATEGORIES_CSV = './titles_to_categories.csv'
 max_title_token_length = 50
 sample_frac = 0.1
@@ -152,18 +151,22 @@ def train(
     label_tensor,
     optimizer,
     batch_size=256,
+    batch_stride=None,
+    batch_offset=0,
     epochs=1,
     steps=None,
     logger=logging.info,
 ):
+    if batch_stride is None:
+        batch_stride = batch_size
     loss_fn = nn.CrossEntropyLoss()
     for epoch in range(epochs):
         model.train()
         start_time = time.time()
-        for i in range(0, input_tensor.shape[0], batch_size):
-            batch_input_tensor = input_tensor[i:i+batch_size]
+        for i in range(0, input_tensor.shape[0] - batch_stride, batch_stride):
+            batch_input_tensor = input_tensor[i + batch_offset : i + batch_offset + batch_size]
             # logging.info(f"batch_input_tensor.shape={batch_input_tensor.shape}")
-            batch_label_tensor = label_tensor[i:i+batch_size]
+            batch_label_tensor = label_tensor[i + batch_offset : i + batch_offset + batch_size]
             # logging.info(f"batch_label_tensor.shape={batch_label_tensor.shape}")
             optimizer.zero_grad()
             output = model(batch_input_tensor)
@@ -222,21 +225,28 @@ def ddp_main_fn(
     model = create_mlp_e32_512(vocab, categories).to(rank)
     ddp_model = nn.parallel.DistributedDataParallel(model, device_ids=[rank])
     ddp_optimizer = torch.optim.Adam(ddp_model.parameters(), lr=0.001)
+    batch_stride = 1024
+    batch_size = batch_stride // world_size
+    assert batch_stride == world_size * batch_size
+    batch_offset = rank * batch_size
 
     train(
         ddp_model,
         train_input_tensor.to(rank),
         train_label_tensor.to(rank),
         ddp_optimizer,
-        batch_size=1024,
+        batch_stride=batch_stride,
+        batch_size=batch_size,
+        batch_offset=batch_offset,
         logger=loginfo,
     )
-    # if rank == 0:
-        
+
+    torch.save(ddp_model.state_dict(), f"./checkpoint/ddp_rank{rank}.checkpoint")
+    loginfo("model saved")
 
 
 def main(_):
-    if not random_input:
+    if True:
         logging.info("----------- Load data -----------")
         train_df, test_df, categories = load_data(TITLES_TO_CATEGORIES_CSV, sample_frac)
         vocab = get_vocab(train_df)
@@ -261,7 +271,7 @@ def main(_):
         test_label_tensor = torch.randint(
             low=0, high=len(categories), size=(test_input_tensor.shape[0], ), dtype=torch.long)
 
-    if False:
+    if True:
         logging.info("----------- CPU training -----------")
         mlp_e32_512 = create_mlp_e32_512(vocab, categories)
         mlp_e32_512_param_count = sum([p.numel() for p in mlp_e32_512.parameters()])
@@ -280,7 +290,7 @@ def main(_):
         logging.info("Evaluating on test set:")
         eval(mlp_e32_512, test_input_tensor, test_label_tensor)
 
-    if True:
+    if False:
         logging.info("----------- Single GPU training -----------")
         assert torch.cuda.is_available()
         device_train_labels = train_label_tensor.to('cuda:0')
@@ -321,7 +331,16 @@ def main(_):
             nprocs=world_size,
             join=True,
         )
-        torch.distributed.destroy_process_group()
+        # torch.distributed.destroy_process_group()
+        state_dict = torch.load("./checkpoint/ddp_rank2.checkpoint")
+        adjusted_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        mlp_e32_512 = create_mlp_e32_512(vocab, categories)
+        mlp_e32_512.load_state_dict(adjusted_state_dict)
+        logging.info("Evaluating on train set:")
+        eval(mlp_e32_512, train_input_tensor, train_label_tensor)
+        logging.info("Evaluating on test set:")
+        eval(mlp_e32_512, test_input_tensor, test_label_tensor)
+
 
     logging.info("----------- Tensor Parallel ------------")
     
