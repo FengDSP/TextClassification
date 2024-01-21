@@ -128,7 +128,7 @@ class MLPModel(nn.Module):
                 nn.ReLU(),
             ])
         self.hidden_layers = nn.ModuleList(hidden_layers)
-        fc_fan_in_dim = hidden_dims[-1] if hidden_dims else embed_dim
+        fc_fan_in_dim = hidden_dims[-1] if hidden_dims else embed_dim * seq_length
         self.fc = nn.Linear(fc_fan_in_dim, num_classes)
 
     def forward(self, x):
@@ -145,6 +145,63 @@ class MLPModel(nn.Module):
         return x
 
 
+class TPMLPModel(nn.Module):
+    def __init__(self,
+                 vocab_size,
+                 embed_dim,
+                 hidden_dims,
+                 seq_length,
+                 num_classes,
+                 rank,
+                 world_size,
+                ):
+        super().__init__()
+        self.rank = rank
+        self.world_size = world_size
+        assert embed_dim % world_size == 0
+        embed_dim_per_rank = embed_dim // world_size
+        self.embedding = nn.Embedding(vocab_size, embed_dim_per_rank, device=f"cuda:{rank}")
+        hidden_layers = []
+        for fan_in_dim, fan_out_dim in zip([embed_dim * seq_length] + hidden_dims[:-1], hidden_dims):
+            assert fan_in_dim % world_size == 0
+            fan_in_dim = fan_in_dim // world_size
+            hidden_layers.extend([
+                nn.Linear(fan_in_dim, fan_out_dim, bias=(rank == 0), device=f"cuda:{rank}"),
+            ])
+        self.relus = nn.ModuleList([nn.ReLU()] * len(hidden_layers))
+        self.hidden_layers = nn.ModuleList(hidden_layers)
+        fc_fan_in_dim = hidden_dims[-1] // world_size if hidden_dims else embed_dim_per_rank * seq_length
+        self.fc = nn.Linear(fc_fan_in_dim, num_classes, bias=(rank == 0), device=f"cuda:{rank}")
+        
+    def forward(self, x):
+        def loginfo(msg):
+            # sys.stdout.write(f"P{self.rank}] {msg}\n")
+            pass
+        loginfo(f"input shape={x.shape}")
+        x = self.embedding(x)
+        loginfo(f"embedding shape={x.shape}")
+        x = torch.reshape(x, x.shape[:-2] + (-1,))
+        loginfo(f"concated shape={x.shape}")
+        for hidden_layer, relu in zip(self.hidden_layers, self.relus):
+            x = hidden_layer(x)
+            loginfo(f"hidden layer shape={x.shape}")
+            # Prepare for the reduce scatter [B, H] -> [D, B, H/D]
+            x = torch.reshape(x, x.shape[:-1] + (self.world_size, x.shape[-1] // self.world_size))
+            loginfo(f"reshaped hidden layer shape={x.shape}")
+            x = torch.transpose(x, 0, -2)
+            loginfo(f"transposed hidden layer shape={x.shape}")            
+            y = torch.zeros_like(x[0])
+            loginfo(f"reduce_scatter output shape={y.shape}")    
+            torch.distributed.reduce_scatter_tensor(y, x, op=torch.distributed.ReduceOp.SUM)
+            x = relu(y)
+            loginfo(f"relu output shape={x.shape}") 
+        loginfo(f"last layer shape={x.shape}")
+        x = self.fc(x)
+        loginfo(f"output shape={x.shape}")
+        torch.distributed.all_reduce(x, op=torch.distributed.ReduceOp.SUM)
+        return x
+
+
 def train(
     model,
     input_tensor,
@@ -156,6 +213,7 @@ def train(
     epochs=1,
     steps=None,
     logger=logging.info,
+    rank=None,  # for debugging only
 ):
     if batch_stride is None:
         batch_stride = batch_size
@@ -169,15 +227,23 @@ def train(
             batch_label_tensor = label_tensor[i + batch_offset : i + batch_offset + batch_size]
             # logging.info(f"batch_label_tensor.shape={batch_label_tensor.shape}")
             optimizer.zero_grad()
+            logger(f"Starting forward. i={i}")
+            if rank > 1:
+                time.sleep(10)
             output = model(batch_input_tensor)
+            logger(f"Finished forward. i={i}")
             # logging.info(f"output.shape={output.shape}")
             loss = loss_fn(output, batch_label_tensor).mean()
             # logging.info(f"loss.shape={loss.shape}")
+            logger(f"Starting backward. i={i}")
+            if rank > 1:
+                time.sleep(10)
             loss.backward()
+            logger(f"Finished backward. i={i}")
             optimizer.step()
             # break
             if i / batch_size % 100 == 0:
-                logging.info(f"Epoch {epoch} step {i / batch_size} loss: {loss.item()}")
+                logger(f"Epoch {epoch} step {i / batch_size} loss: {loss.item()}")
             if steps and i >= steps:
                     break
         end_time = time.time()
@@ -195,21 +261,21 @@ def eval(model, input_tensor, label_tensor):
     logging.info(f"Accuracy: {correct.item() * 100:.2f}%")
 
 
-def create_mlp_e32_512(vocab, categories):
+def create_mlp_e32_512(vocab_size, category_size):
     return MLPModel(
-        vocab_size=len(vocab),
+        vocab_size=vocab_size,
         embed_dim=32,
         hidden_dims=[512],
         seq_length=max_title_token_length,
-        num_classes=len(categories),
+        num_classes=category_size,
     )
 
 
 def ddp_main_fn(
     rank,
     world_size,
-    vocab,
-    categories,
+    vocab_size,
+    category_size,
     train_input_tensor,
     train_label_tensor,
 ):
@@ -220,9 +286,9 @@ def ddp_main_fn(
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '18121'
     
-    torch.distributed.init_process_group('gloo', rank=rank, world_size=world_size)
+    torch.distributed.init_process_group('nccl', rank=rank, world_size=world_size)
 
-    model = create_mlp_e32_512(vocab, categories).to(rank)
+    model = create_mlp_e32_512(vocab_size, category_size).to(rank)
     ddp_model = nn.parallel.DistributedDataParallel(model, device_ids=[rank])
     ddp_optimizer = torch.optim.Adam(ddp_model.parameters(), lr=0.001)
     batch_stride = 1024
@@ -245,9 +311,51 @@ def ddp_main_fn(
     loginfo("model saved")
 
 
+def tp_main_fn(
+    rank,
+    world_size,
+    vocab_size,
+    category_size,
+    train_input_tensor,
+    train_label_tensor,
+):
+    def loginfo(msg):
+        sys.stdout.write(f"P{rank}] {msg}\n")
+
+    loginfo(f"Starting tp_main_fn rank {rank} of world_size {world_size} ...")
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '18121'
+    
+    torch.distributed.init_process_group('nccl', rank=rank, world_size=world_size)
+    model = TPMLPModel(
+        vocab_size=vocab_size,
+        embed_dim=32,
+        hidden_dims=[512],
+        seq_length=max_title_token_length,
+        num_classes=category_size,
+        rank=rank,
+        world_size=world_size,
+    )
+    tp_optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    train(
+        model,
+        train_input_tensor.to(rank),
+        train_label_tensor.to(rank),
+        tp_optimizer,
+        batch_size=1024,
+        logger=loginfo,
+        rank=rank,
+    )
+
+    torch.save(model.state_dict(), f"./checkpoint/tp_rank{rank}.checkpoint")
+    loginfo("model saved")
+
+
+
 def main(_):
-    if True:
-        logging.info("----------- Load data -----------")
+    if False:
+        logging.info("----------- Load Data from CSV files -----------")
         train_df, test_df, categories = load_data(TITLES_TO_CATEGORIES_CSV, sample_frac)
         vocab = get_vocab(train_df)
         logging.info("Preparing train input tensor ...")
@@ -258,6 +366,22 @@ def main(_):
         test_input_tensor = get_input_tensor(test_df, max_title_token_length, vocab,)
         logging.info("Preparing test label tensor ...")
         test_label_tensor = get_label_tensor(test_df)
+        # save vocab, categories, train_input_tensor, train_label_tensor, test_input_tensor, test_label_tensor
+        logging.info("----------- Saving Data to Cache -----------")
+        torch.save(vocab, "./checkpoint/vocab.pt")
+        torch.save(categories, "./checkpoint/categories.pt")
+        torch.save(train_input_tensor, "./checkpoint/train_input_tensor.pt")
+        torch.save(train_label_tensor, "./checkpoint/train_label_tensor.pt")
+        torch.save(test_input_tensor, "./checkpoint/test_input_tensor.pt")
+        torch.save(test_label_tensor, "./checkpoint/test_label_tensor.pt")
+    elif True:
+        logging.info("----------- Load Data from Cache -----------")
+        vocab = torch.load("./checkpoint/vocab.pt")
+        categories = torch.load("./checkpoint/categories.pt")
+        train_input_tensor = torch.load("./checkpoint/train_input_tensor.pt")
+        train_label_tensor = torch.load("./checkpoint/train_label_tensor.pt")
+        test_input_tensor = torch.load("./checkpoint/test_input_tensor.pt")
+        test_label_tensor = torch.load("./checkpoint/test_label_tensor.pt")
     else:
         logging.info("----------- Generate Random Data for Debugging -----------")
         categories = range(100)
@@ -271,9 +395,9 @@ def main(_):
         test_label_tensor = torch.randint(
             low=0, high=len(categories), size=(test_input_tensor.shape[0], ), dtype=torch.long)
 
-    if True:
+    if False:
         logging.info("----------- CPU training -----------")
-        mlp_e32_512 = create_mlp_e32_512(vocab, categories)
+        mlp_e32_512 = create_mlp_e32_512(len(vocab), len(categories))
         mlp_e32_512_param_count = sum([p.numel() for p in mlp_e32_512.parameters()])
         logging.info(f"Total number of parameters for model mlp_e32_512: {mlp_e32_512_param_count}")
         optimizer_mlp_e32_512 = torch.optim.Adam(mlp_e32_512.parameters(), lr=0.001)
@@ -295,7 +419,7 @@ def main(_):
         assert torch.cuda.is_available()
         device_train_labels = train_label_tensor.to('cuda:0')
         device_train_inputs = train_input_tensor.to('cuda:0')
-        device_mlp_e32_512 = create_mlp_e32_512(vocab, categories).to('cuda:0')
+        device_mlp_e32_512 = create_mlp_e32_512(len(vocab), len(categories)).to('cuda:0')
         device_optimizer_mlp_e32_512 = torch.optim.Adam(device_mlp_e32_512.parameters(), lr=0.001)
         train(
             device_mlp_e32_512,
@@ -308,7 +432,7 @@ def main(_):
     if False:
         logging.info("----------- Data Parallel ------------")
         logging.info(f"GPU count = {torch.cuda.device_count()}")
-        dd_mlp_e32_512 = nn.DataParallel(create_mlp_e32_512(vocab, categories))
+        dd_mlp_e32_512 = nn.DataParallel(create_mlp_e32_512(len(vocab), len(categories)))
         dd_mlp_e32_512 = dd_mlp_e32_512.to('cuda:0')
         dd_optimizer_mlp_e32_512 = torch.optim.Adam(dd_mlp_e32_512.parameters(), lr=0.001)
         device_train_labels = train_label_tensor.to('cuda:0')
@@ -321,20 +445,20 @@ def main(_):
             batch_size=1024,
         )
 
-    if True:
+    if False:
         logging.info("----------- Distributed Data Parallel ------------")
         world_size = 4
         assert world_size <= torch.cuda.device_count()
         torch.multiprocessing.spawn(
             ddp_main_fn,
-            args=(world_size, vocab, categories, train_input_tensor, train_label_tensor),
+            args=(world_size, len(vocab), len(categories), train_input_tensor, train_label_tensor),
             nprocs=world_size,
             join=True,
         )
         # torch.distributed.destroy_process_group()
         state_dict = torch.load("./checkpoint/ddp_rank2.checkpoint")
         adjusted_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-        mlp_e32_512 = create_mlp_e32_512(vocab, categories)
+        mlp_e32_512 = create_mlp_e32_512(len(vocab), len(categories))
         mlp_e32_512.load_state_dict(adjusted_state_dict)
         logging.info("Evaluating on train set:")
         eval(mlp_e32_512, train_input_tensor, train_label_tensor)
@@ -342,7 +466,16 @@ def main(_):
         eval(mlp_e32_512, test_input_tensor, test_label_tensor)
 
 
-    logging.info("----------- Tensor Parallel ------------")
+    if True:
+        logging.info("----------- Tensor Parallel ------------")
+        world_size = 4
+        assert world_size <= torch.cuda.device_count()
+        torch.multiprocessing.spawn(
+            tp_main_fn,
+            args=(world_size, len(vocab), len(categories), train_input_tensor, train_label_tensor),
+            nprocs=world_size,
+            join=True,
+        )
     
     logging.info("----------- Done -----------")
 
