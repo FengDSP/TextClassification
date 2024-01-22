@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import datetime
 import time
 import torch
 import sys
@@ -229,7 +230,7 @@ def train(
             optimizer.zero_grad()
             logger(f"Starting forward. i={i}")
             if rank > 1:
-                time.sleep(10)
+                time.sleep(2)
             output = model(batch_input_tensor)
             logger(f"Finished forward. i={i}")
             # logging.info(f"output.shape={output.shape}")
@@ -237,7 +238,7 @@ def train(
             # logging.info(f"loss.shape={loss.shape}")
             logger(f"Starting backward. i={i}")
             if rank > 1:
-                time.sleep(10)
+                time.sleep(2)
             loss.backward()
             logger(f"Finished backward. i={i}")
             optimizer.step()
@@ -320,13 +321,17 @@ def tp_main_fn(
     train_label_tensor,
 ):
     def loginfo(msg):
-        sys.stdout.write(f"P{rank}] {msg}\n")
+        t = datetime.datetime.now().strftime("%H:%M:%S.%f")
+        sys.stdout.write(f"Rank{rank} {t}] {msg}\n")
 
     loginfo(f"Starting tp_main_fn rank {rank} of world_size {world_size} ...")
+    os.environ['NCCL_BLOCKING_WAIT'] = '1'
+    # os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '18121'
     
-    torch.distributed.init_process_group('nccl', rank=rank, world_size=world_size)
+    torch.distributed.init_process_group(
+        'nccl', rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=3))
     model = TPMLPModel(
         vocab_size=vocab_size,
         embed_dim=32,
