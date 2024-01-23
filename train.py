@@ -145,6 +145,63 @@ class MLPModel(nn.Module):
         # logging.info(f"output shape={x.shape}")
         return x
 
+class CustomizedLinear(torch.autograd.Function):
+
+    @staticmethod
+    # @custom_fwd
+    def forward(
+        ctx,
+        input,  # ..., h1
+        weights,  # h1, h2
+        bias,  # h2
+    ):
+        ctx.save_for_backward(input, weights)
+        return input @ weights + bias   # ..., h2
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output,  # ..., h2
+    ):
+        input, weights = ctx.saved_tensors
+        grad_input = grad_output @ weights.T
+        grad_weights = input.reshape((-1, input.shape[-1])).T @ grad_output.reshape((-1, grad_output.shape[-1]))
+        grad_bias = grad_output
+        return grad_input, grad_weights, grad_bias
+
+
+class MLPModelWithCustomizedLinear(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dims, seq_length, num_classes):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        hidden_layer_weights = []
+        hidden_layer_biases = []
+        for fan_in_dim, fan_out_dim in zip([embed_dim * seq_length] + hidden_dims[:-1], hidden_dims):
+            w = torch.empty(fan_in_dim, fan_out_dim)
+            nn.init.kaiming_uniform_(w, mode='fan_in', nonlinearity='relu')
+            b = torch.zeros((fan_out_dim,))
+            hidden_layer_weights.append(nn.parameter.Parameter(w))
+            hidden_layer_biases.append(nn.parameter.Parameter(b))
+        self.linear_layer_weights = nn.ParameterList(hidden_layer_weights)
+        self.linear_layer_biases = nn.ParameterList(hidden_layer_biases)
+        self.relus = nn.ModuleList([nn.ReLU()] * len(hidden_dims))
+        fc_fan_in_dim = hidden_dims[-1] if hidden_dims else embed_dim * seq_length
+        self.fc = nn.Linear(fc_fan_in_dim, num_classes)
+
+    def forward(self, x):
+        # logging.info(f"input shape={x.shape}")
+        x = self.embedding(x)
+        # logging.info(f"embedding shape={x.shape}")
+        x = torch.reshape(x, x.shape[:-2] + (-1,))
+        # logging.info(f"concated shape={x.shape}")
+        for w, b, relu in zip(self.linear_layer_weights, self.linear_layer_biases, self.relus):
+            x = CustomizedLinear.apply(x, w, b)
+            x = relu(x)
+        # logging.info(f"last layer shape={x.shape}")
+        x = self.fc(x)
+        # logging.info(f"output shape={x.shape}")
+        return x
+
 
 class TPMLPModel(nn.Module):
     def __init__(self,
@@ -188,6 +245,11 @@ class TPMLPModel(nn.Module):
             loginfo(f"hidden layer shape={x.shape}")
             # Prepare for the reduce scatter [B, H] -> [D, B, H/D]
             x = torch.reshape(x, x.shape[:-1] + (self.world_size, x.shape[-1] // self.world_size))
+            if not self.weight.requires_grad:
+                self._forward_impl = linear_with_frozen_weight
+            else:
+                self._forward_impl = linear_with_grad_accumulation
+            x = self._forward_impl(x)
             loginfo(f"reshaped hidden layer shape={x.shape}")
             x = torch.transpose(x, 0, -2)
             loginfo(f"transposed hidden layer shape={x.shape}")            
@@ -228,19 +290,19 @@ def train(
             batch_label_tensor = label_tensor[i + batch_offset : i + batch_offset + batch_size]
             # logging.info(f"batch_label_tensor.shape={batch_label_tensor.shape}")
             optimizer.zero_grad()
-            logger(f"Starting forward. i={i}")
-            if rank > 1:
-                time.sleep(2)
+            # logger(f"Starting forward. i={i}")
+            # if rank > 1:
+            #     time.sleep(2)
             output = model(batch_input_tensor)
-            logger(f"Finished forward. i={i}")
+            # logger(f"Finished forward. i={i}")
             # logging.info(f"output.shape={output.shape}")
             loss = loss_fn(output, batch_label_tensor).mean()
             # logging.info(f"loss.shape={loss.shape}")
-            logger(f"Starting backward. i={i}")
-            if rank > 1:
-                time.sleep(2)
+            # logger(f"Starting backward. i={i}")
+            # if rank > 1:
+            #     time.sleep(2)
             loss.backward()
-            logger(f"Finished backward. i={i}")
+            # logger(f"Finished backward. i={i}")
             optimizer.step()
             # break
             if i / batch_size % 100 == 0:
@@ -262,8 +324,8 @@ def eval(model, input_tensor, label_tensor):
     logging.info(f"Accuracy: {correct.item() * 100:.2f}%")
 
 
-def create_mlp_e32_512(vocab_size, category_size):
-    return MLPModel(
+def create_mlp_e32_512(vocab_size, category_size, model=MLPModel):
+    return model(
         vocab_size=vocab_size,
         embed_dim=32,
         hidden_dims=[512],
@@ -400,7 +462,7 @@ def main(_):
         test_label_tensor = torch.randint(
             low=0, high=len(categories), size=(test_input_tensor.shape[0], ), dtype=torch.long)
 
-    if False:
+    if True:
         logging.info("----------- CPU training -----------")
         mlp_e32_512 = create_mlp_e32_512(len(vocab), len(categories))
         mlp_e32_512_param_count = sum([p.numel() for p in mlp_e32_512.parameters()])
@@ -418,6 +480,20 @@ def main(_):
     
         logging.info("Evaluating on test set:")
         eval(mlp_e32_512, test_input_tensor, test_label_tensor)
+
+    if False:
+        logging.info("----------- CPU training With Customized Linear -----------")
+        mlp_e32_512 = create_mlp_e32_512(len(vocab), len(categories), model=MLPModelWithCustomizedLinear)
+        mlp_e32_512_param_count = sum([p.numel() for p in mlp_e32_512.parameters()])
+        logging.info(f"Total number of parameters for model mlp_e32_512: {mlp_e32_512_param_count}")
+        optimizer_mlp_e32_512 = torch.optim.Adam(mlp_e32_512.parameters(), lr=0.001)
+        train(
+            mlp_e32_512,
+            train_input_tensor,
+            train_label_tensor,
+            optimizer_mlp_e32_512,
+            batch_size=1024,
+        )
 
     if False:
         logging.info("----------- Single GPU training -----------")
@@ -471,7 +547,7 @@ def main(_):
         eval(mlp_e32_512, test_input_tensor, test_label_tensor)
 
 
-    if True:
+    if False:
         logging.info("----------- Tensor Parallel ------------")
         world_size = 4
         assert world_size <= torch.cuda.device_count()
