@@ -148,7 +148,6 @@ class MLPModel(nn.Module):
 class CustomizedLinear(torch.autograd.Function):
 
     @staticmethod
-    # @custom_fwd
     def forward(
         ctx,
         input,  # ..., h1
@@ -203,6 +202,56 @@ class MLPModelWithCustomizedLinear(nn.Module):
         return x
 
 
+def loginfo(rank, msg):
+    # sys.stdout.write(f"P{rank}] {msg}\n")
+    pass
+
+
+class RowLinearComm(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        input,  # b, h
+    ):
+        world_size = torch.distributed.get_world_size()
+        # Prepare for the reduce scatter [B, H] -> [WorldSize, B, H/WorldSize]
+        # this assumption is not necessary if we use torch.permute instead of torch.transpose
+        assert len(input.shape) == 2
+        x = torch.reshape(input, input.shape[:-1] + (world_size, input.shape[-1] // world_size))
+        # loginfo(f"reshaped hidden layer shape={x.shape}")
+        x = torch.transpose(x, 0, -2)
+        # loginfo(f"transposed hidden layer shape={x.shape}")
+        
+        y = torch.zeros_like(x[0])
+        # loginfo(f"reduce_scatter output shape={y.shape}")
+        torch.distributed.reduce_scatter_tensor(y, x, op=torch.distributed.ReduceOp.SUM)
+        return y
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output,  # b, h/world_size
+    ):
+        world_size = torch.distributed.get_world_size()
+        all_grad_outputs = [torch.zeros_like(grad_output)] * world_size
+        torch.distributed.all_gather(all_grad_outputs, grad_output)
+        grad_input = torch.cat(all_grad_outputs, dim=-1)
+        return grad_input, None, None
+
+
+class AllReduceComm(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, input):
+        torch.distributed.all_reduce(input)
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+
 class TPMLPModel(nn.Module):
     def __init__(self,
                  vocab_size,
@@ -232,37 +281,27 @@ class TPMLPModel(nn.Module):
         self.fc = nn.Linear(fc_fan_in_dim, num_classes, bias=(rank == 0), device=f"cuda:{rank}")
         
     def forward(self, x):
-        def loginfo(msg):
-            # sys.stdout.write(f"P{self.rank}] {msg}\n")
-            pass
-        loginfo(f"input shape={x.shape}")
+        loginfo(self.rank, f"input shape={x.shape}")
         x = self.embedding(x)
-        loginfo(f"embedding shape={x.shape}")
+        loginfo(self.rank, f"embedding shape={x.shape}")
         x = torch.reshape(x, x.shape[:-2] + (-1,))
-        loginfo(f"concated shape={x.shape}")
+        loginfo(self.rank, f"concated shape={x.shape}")
         for hidden_layer, relu in zip(self.hidden_layers, self.relus):
             x = hidden_layer(x)
-            loginfo(f"hidden layer shape={x.shape}")
-            # Prepare for the reduce scatter [B, H] -> [D, B, H/D]
-            x = torch.reshape(x, x.shape[:-1] + (self.world_size, x.shape[-1] // self.world_size))
-            if not self.weight.requires_grad:
-                self._forward_impl = linear_with_frozen_weight
-            else:
-                self._forward_impl = linear_with_grad_accumulation
-            x = self._forward_impl(x)
-            loginfo(f"reshaped hidden layer shape={x.shape}")
-            x = torch.transpose(x, 0, -2)
-            loginfo(f"transposed hidden layer shape={x.shape}")            
-            y = torch.zeros_like(x[0])
-            loginfo(f"reduce_scatter output shape={y.shape}")    
-            torch.distributed.reduce_scatter_tensor(y, x, op=torch.distributed.ReduceOp.SUM)
-            x = relu(y)
-            loginfo(f"relu output shape={x.shape}") 
-        loginfo(f"last layer shape={x.shape}")
+            loginfo(self.rank, f"hidden layer shape={x.shape}")
+            # if not self.weight.requires_grad:
+            #     self._forward_impl = linear_with_frozen_weight
+            # else:
+            #     self._forward_impl = linear_with_grad_accumulation
+            x = RowLinearComm.apply(x)
+            x = relu(x)
+            loginfo(self.rank, f"relu output shape={x.shape}") 
+        loginfo(self.rank, f"last layer shape={x.shape}")
         x = self.fc(x)
-        loginfo(f"output shape={x.shape}")
-        torch.distributed.all_reduce(x, op=torch.distributed.ReduceOp.SUM)
-        return x
+        loginfo(self.rank, f"output shape={x.shape}")
+        # torch.distributed.all_reduce(x, op=torch.distributed.ReduceOp.SUM)
+        # return x
+        return AllReduceComm.apply(x)
 
 
 def train(
@@ -462,7 +501,7 @@ def main(_):
         test_label_tensor = torch.randint(
             low=0, high=len(categories), size=(test_input_tensor.shape[0], ), dtype=torch.long)
 
-    if True:
+    if False:
         logging.info("----------- CPU training -----------")
         mlp_e32_512 = create_mlp_e32_512(len(vocab), len(categories))
         mlp_e32_512_param_count = sum([p.numel() for p in mlp_e32_512.parameters()])
@@ -495,7 +534,7 @@ def main(_):
             batch_size=1024,
         )
 
-    if False:
+    if True:
         logging.info("----------- Single GPU training -----------")
         assert torch.cuda.is_available()
         device_train_labels = train_label_tensor.to('cuda:0')
@@ -547,7 +586,7 @@ def main(_):
         eval(mlp_e32_512, test_input_tensor, test_label_tensor)
 
 
-    if False:
+    if True:
         logging.info("----------- Tensor Parallel ------------")
         world_size = 4
         assert world_size <= torch.cuda.device_count()
