@@ -133,16 +133,11 @@ class MLPModel(nn.Module):
         self.fc = nn.Linear(fc_fan_in_dim, num_classes)
 
     def forward(self, x):
-        # logging.info(f"input shape={x.shape}")
         x = self.embedding(x)
-        # logging.info(f"embedding shape={x.shape}")
         x = torch.reshape(x, x.shape[:-2] + (-1,))
-        # logging.info(f"concated shape={x.shape}")
         for hidden_layer in self.hidden_layers:
             x = hidden_layer(x)
-        # logging.info(f"last layer shape={x.shape}")
         x = self.fc(x)
-        # logging.info(f"output shape={x.shape}")
         return x
 
 
@@ -189,17 +184,12 @@ class MLPModelWithCustomizedLinear(nn.Module):
         self.fc = nn.Linear(fc_fan_in_dim, num_classes)
 
     def forward(self, x):
-        # logging.info(f"input shape={x.shape}")
         x = self.embedding(x)
-        # logging.info(f"embedding shape={x.shape}")
         x = torch.reshape(x, x.shape[:-2] + (-1,))
-        # logging.info(f"concated shape={x.shape}")
         for w, b, relu in zip(self.linear_layer_weights, self.linear_layer_biases, self.relus):
             x = CustomizedLinear.apply(x, w, b)
             x = relu(x)
-        # logging.info(f"last layer shape={x.shape}")
         x = self.fc(x)
-        # logging.info(f"output shape={x.shape}")
         return x
 
 
@@ -209,8 +199,10 @@ def loginfo(rank, msg):
 
 
 class TPMLPModelWithRowLinear(nn.Module):
-
+    # We are doing sequence row parallel linear so this needs to be a reduce_scatter rather than a all_reduce.
     row_linear_comm = None
+
+    # This needs to be an all_reduce in the very end, which makes the logits fully replicated at all ranks.
     fc_comm = None
     
     def __init__(self,
@@ -268,12 +260,9 @@ def direct_row_linear_comm(x):
     # this assumption is not necessary if we use torch.permute instead of torch.transpose
     assert len(x.shape) == 2
     x = torch.reshape(x, x.shape[:-1] + (world_size, x.shape[-1] // world_size))
-    # loginfo(f"reshaped hidden layer shape={x.shape}")
     x = torch.transpose(x, 0, -2)
-    # loginfo(f"transposed hidden layer shape={x.shape}")
     
     y = torch.zeros_like(x[0])
-    # loginfo(f"reduce_scatter output shape={y.shape}")
     torch.distributed.reduce_scatter_tensor(y, x, op=torch.distributed.ReduceOp.SUM)
     return y
 
@@ -300,12 +289,9 @@ class RowLinearComm(torch.autograd.Function):
         # this assumption is not necessary if we use torch.permute instead of torch.transpose
         assert len(input.shape) == 2
         x = torch.reshape(input, input.shape[:-1] + (world_size, input.shape[-1] // world_size))
-        # loginfo(f"reshaped hidden layer shape={x.shape}")
         x = torch.transpose(x, 0, -2)
-        # loginfo(f"transposed hidden layer shape={x.shape}")
         
         y = torch.zeros_like(x[0])
-        # loginfo(f"reduce_scatter output shape={y.shape}")
         torch.distributed.reduce_scatter_tensor(y, x, op=torch.distributed.ReduceOp.SUM)
         return y
 
@@ -330,7 +316,6 @@ class AllReduceComm(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        # torch.distributed.all_reduce(grad_output)
         return grad_output
 
 
@@ -355,12 +340,9 @@ class AllGather(torch.autograd.Function):
         # this assumption is not necessary if we use torch.permute instead of torch.transpose
         assert len(grad_output.shape) == 2
         x = torch.reshape(grad_output, grad_output.shape[:-1] + (world_size, grad_output.shape[-1] // world_size))
-        # loginfo(f"reshaped hidden layer shape={x.shape}")
         x = torch.transpose(x, 0, -2)
-        # loginfo(f"transposed hidden layer shape={x.shape}")
         
         y = torch.zeros_like(x[0])
-        # loginfo(f"reduce_scatter output shape={y.shape}")
         torch.distributed.reduce_scatter_tensor(y, x, op=torch.distributed.ReduceOp.SUM)
         return y
         
@@ -455,32 +437,18 @@ def train(
         start_time = time.time()
         for i in range(0, input_tensor.shape[0] - batch_stride, batch_stride):
             batch_input_tensor = input_tensor[i + batch_offset : i + batch_offset + batch_size]
-            # logging.info(f"batch_input_tensor.shape={batch_input_tensor.shape}")
             batch_label_tensor = label_tensor[i + batch_offset : i + batch_offset + batch_size]
-            # logging.info(f"batch_label_tensor.shape={batch_label_tensor.shape}")
             optimizer.zero_grad()
-            # logger(f"Starting forward. i={i}")
-            # if rank > 1:
-            #     time.sleep(2)
             output = model(batch_input_tensor)
-            # logger(f"Finished forward. i={i}")
-            # logging.info(f"output.shape={output.shape}")
             loss = loss_fn(output, batch_label_tensor).mean()
-            # logging.info(f"loss.shape={loss.shape}")
-            # logger(f"Starting backward. i={i}")
-            # if rank > 1:
-            #     time.sleep(2)
             loss.backward()
-            # logger(f"Finished backward. i={i}")
             optimizer.step()
-            # break
             if i / batch_size % 100 == 0:
                 logger(f"Epoch {epoch} step {i / batch_size} loss: {loss.item()}")
             if steps and i >= steps:
                     break
         end_time = time.time()
         logger(f"Epoch {epoch} loss: {loss.item()}  time: {(end_time - start_time):.2f}s")
-        # break
     return
 
 
