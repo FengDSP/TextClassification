@@ -330,6 +330,7 @@ class AllReduceComm(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        # torch.distributed.all_reduce(grad_output)
         return grad_output
 
 
@@ -337,6 +338,33 @@ class TPMLPModelWithCustomizedRowLinear(TPMLPModelWithRowLinear):
     row_linear_comm = RowLinearComm.apply
     fc_comm = AllReduceComm.apply
 
+
+class AllGather(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, input):
+        world_size = torch.distributed.get_world_size()
+        all_input = [torch.zeros_like(input)] * world_size
+        torch.distributed.all_gather(all_input, input)
+        return torch.cat(all_input, dim=-1)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        world_size = torch.distributed.get_world_size()
+        # Prepare for the reduce scatter [B, H] -> [WorldSize, B, H/WorldSize]
+        # this assumption is not necessary if we use torch.permute instead of torch.transpose
+        assert len(grad_output.shape) == 2
+        x = torch.reshape(grad_output, grad_output.shape[:-1] + (world_size, grad_output.shape[-1] // world_size))
+        # loginfo(f"reshaped hidden layer shape={x.shape}")
+        x = torch.transpose(x, 0, -2)
+        # loginfo(f"transposed hidden layer shape={x.shape}")
+        
+        y = torch.zeros_like(x[0])
+        # loginfo(f"reduce_scatter output shape={y.shape}")
+        torch.distributed.reduce_scatter_tensor(y, x, op=torch.distributed.ReduceOp.SUM)
+        return y
+        
+        
 
 class TPMLPModelWithColumnLinear(nn.Module):
 
@@ -351,8 +379,7 @@ class TPMLPModelWithColumnLinear(nn.Module):
         # assert x.requires_grad
         # return x
 
-        # to be implemented
-        pass
+        return AllGather.apply(x)
 
     def __init__(self,
                  vocab_size,
@@ -386,32 +413,23 @@ class TPMLPModelWithColumnLinear(nn.Module):
     def forward(self, x):
         loginfo(self.rank, f"input shape={x.shape}")
         x = self.embedding(x)
-        assert x.requires_grad
         loginfo(self.rank, f"embedding shape={x.shape}")
         x = torch.reshape(x, x.shape[:-2] + (-1,))
-        assert x.requires_grad
         loginfo(self.rank, f"concated shape={x.shape}")
         for hidden_layer, relu in zip(self.hidden_layers, self.relus):
             x = self.__class__.column_linear_comm(x)  # All gather
-            assert x.requires_grad
             # x.shape == [..., H_in]
             x = hidden_layer(x)
-            assert x.requires_grad
             # x.shape == [..., H_out / W]
             loginfo(self.rank, f"hidden layer shape={x.shape}")
             x = relu(x)
-            assert x.requires_grad
             loginfo(self.rank, f"relu output shape={x.shape}") 
         loginfo(self.rank, f"last layer shape={x.shape}")
         x = self.__class__.column_linear_comm(x)
-        assert x.requires_grad
         x = self.fc(x)
-        assert x.requires_grad
         loginfo(self.rank, f"output shape={x.shape}")
         x = self.__class__.column_linear_comm(x)
-        assert x.requires_grad
         logits = x[..., :self.num_classes]
-        assert logits.requires_grad
         return logits
         
 
