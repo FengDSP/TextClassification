@@ -632,7 +632,7 @@ def main(_):
         test_label_tensor = torch.randint(
             low=0, high=len(categories), size=(test_input_tensor.shape[0], ), dtype=torch.long)
 
-    if False:
+    if True:
         logging.info("----------- CPU training -----------")
         mlp_e32_512 = create_mlp_e32_512(len(vocab), len(categories))
         mlp_e32_512_param_count = sum([p.numel() for p in mlp_e32_512.parameters()])
@@ -651,7 +651,7 @@ def main(_):
         logging.info("Evaluating on test set:")
         eval(mlp_e32_512, test_input_tensor, test_label_tensor)
 
-    if False:
+    if True:
         logging.info("----------- CPU training With Customized Linear -----------")
         mlp_e32_512 = create_mlp_e32_512(len(vocab), len(categories), model=MLPModelWithCustomizedLinear)
         mlp_e32_512_param_count = sum([p.numel() for p in mlp_e32_512.parameters()])
@@ -680,7 +680,7 @@ def main(_):
             batch_size=1024,
         )
 
-    if False:
+    if True:
         logging.info("----------- Data Parallel ------------")
         logging.info(f"GPU count = {torch.cuda.device_count()}")
         dd_mlp_e32_512 = nn.DataParallel(create_mlp_e32_512(len(vocab), len(categories)))
@@ -696,7 +696,7 @@ def main(_):
             batch_size=1024,
         )
 
-    if False:
+    if True:
         logging.info("----------- Distributed Data Parallel ------------")
         world_size = 4
         assert world_size <= torch.cuda.device_count()
@@ -716,7 +716,7 @@ def main(_):
         logging.info("Evaluating on test set:")
         eval(mlp_e32_512, test_input_tensor, test_label_tensor)
 
-    if False:
+    if True:
         logging.info("----------- Tensor Parallel Row Linear ------------")
         world_size = 4
         assert world_size <= torch.cuda.device_count()
@@ -734,7 +734,7 @@ def main(_):
             join=True,
         )
 
-    if False:
+    if True:
         logging.info("----------- Tensor Parallel Customized Row Linear ------------")
         world_size = 4
         assert world_size <= torch.cuda.device_count()
