@@ -145,6 +145,7 @@ class MLPModel(nn.Module):
         # logging.info(f"output shape={x.shape}")
         return x
 
+
 class CustomizedLinear(torch.autograd.Function):
 
     @staticmethod
@@ -207,52 +208,11 @@ def loginfo(rank, msg):
     pass
 
 
-class RowLinearComm(torch.autograd.Function):
+class TPMLPModelWithRowLinear(nn.Module):
 
-    @staticmethod
-    def forward(
-        ctx,
-        input,  # b, h
-    ):
-        world_size = torch.distributed.get_world_size()
-        # Prepare for the reduce scatter [B, H] -> [WorldSize, B, H/WorldSize]
-        # this assumption is not necessary if we use torch.permute instead of torch.transpose
-        assert len(input.shape) == 2
-        x = torch.reshape(input, input.shape[:-1] + (world_size, input.shape[-1] // world_size))
-        # loginfo(f"reshaped hidden layer shape={x.shape}")
-        x = torch.transpose(x, 0, -2)
-        # loginfo(f"transposed hidden layer shape={x.shape}")
-        
-        y = torch.zeros_like(x[0])
-        # loginfo(f"reduce_scatter output shape={y.shape}")
-        torch.distributed.reduce_scatter_tensor(y, x, op=torch.distributed.ReduceOp.SUM)
-        return y
-
-    @staticmethod
-    def backward(
-        ctx,
-        grad_output,  # b, h/world_size
-    ):
-        world_size = torch.distributed.get_world_size()
-        all_grad_outputs = [torch.zeros_like(grad_output)] * world_size
-        torch.distributed.all_gather(all_grad_outputs, grad_output)
-        grad_input = torch.cat(all_grad_outputs, dim=-1)
-        return grad_input, None, None
-
-
-class AllReduceComm(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, input):
-        torch.distributed.all_reduce(input)
-        return input
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output
-
-
-class TPMLPModel(nn.Module):
+    row_linear_comm = None
+    fc_comm = None
+    
     def __init__(self,
                  vocab_size,
                  embed_dim,
@@ -293,15 +253,167 @@ class TPMLPModel(nn.Module):
             #     self._forward_impl = linear_with_frozen_weight
             # else:
             #     self._forward_impl = linear_with_grad_accumulation
-            x = RowLinearComm.apply(x)
+            x = self.__class__.row_linear_comm(x)
             x = relu(x)
             loginfo(self.rank, f"relu output shape={x.shape}") 
         loginfo(self.rank, f"last layer shape={x.shape}")
         x = self.fc(x)
         loginfo(self.rank, f"output shape={x.shape}")
-        # torch.distributed.all_reduce(x, op=torch.distributed.ReduceOp.SUM)
+        return self.__class__.fc_comm(x)
+
+
+def direct_row_linear_comm(x):
+    world_size = torch.distributed.get_world_size()
+    # Prepare for the reduce scatter [B, H] -> [WorldSize, B, H/WorldSize]
+    # this assumption is not necessary if we use torch.permute instead of torch.transpose
+    assert len(x.shape) == 2
+    x = torch.reshape(x, x.shape[:-1] + (world_size, x.shape[-1] // world_size))
+    # loginfo(f"reshaped hidden layer shape={x.shape}")
+    x = torch.transpose(x, 0, -2)
+    # loginfo(f"transposed hidden layer shape={x.shape}")
+    
+    y = torch.zeros_like(x[0])
+    # loginfo(f"reduce_scatter output shape={y.shape}")
+    torch.distributed.reduce_scatter_tensor(y, x, op=torch.distributed.ReduceOp.SUM)
+    return y
+
+
+def direct_fc_comm(x):
+    torch.distributed.all_reduce(x, op=torch.distributed.ReduceOp.SUM)
+    return x
+
+
+class TPMLPModelWithDirectRowLinear(TPMLPModelWithRowLinear):
+    row_linear_comm = direct_row_linear_comm
+    fc_comm = direct_fc_comm
+
+
+class RowLinearComm(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        input,  # b, h
+    ):
+        world_size = torch.distributed.get_world_size()
+        # Prepare for the reduce scatter [B, H] -> [WorldSize, B, H/WorldSize]
+        # this assumption is not necessary if we use torch.permute instead of torch.transpose
+        assert len(input.shape) == 2
+        x = torch.reshape(input, input.shape[:-1] + (world_size, input.shape[-1] // world_size))
+        # loginfo(f"reshaped hidden layer shape={x.shape}")
+        x = torch.transpose(x, 0, -2)
+        # loginfo(f"transposed hidden layer shape={x.shape}")
+        
+        y = torch.zeros_like(x[0])
+        # loginfo(f"reduce_scatter output shape={y.shape}")
+        torch.distributed.reduce_scatter_tensor(y, x, op=torch.distributed.ReduceOp.SUM)
+        return y
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output,  # b, h/world_size
+    ):
+        world_size = torch.distributed.get_world_size()
+        all_grad_outputs = [torch.zeros_like(grad_output)] * world_size
+        torch.distributed.all_gather(all_grad_outputs, grad_output)
+        grad_input = torch.cat(all_grad_outputs, dim=-1)
+        return grad_input
+
+
+class AllReduceComm(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, input):
+        torch.distributed.all_reduce(input)
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+
+class TPMLPModelWithCustomizedRowLinear(TPMLPModelWithRowLinear):
+    row_linear_comm = RowLinearComm.apply
+    fc_comm = AllReduceComm.apply
+
+
+class TPMLPModelWithColumnLinear(nn.Module):
+
+    @staticmethod
+    def column_linear_comm(x):
+        # This doesn't work since backprop doesn't flow back through all_gather.
+        # world_size = torch.distributed.get_world_size()
+        # all_x = [torch.zeros_like(x, requires_grad=True)] * world_size
+        # assert all_x[0].requires_grad
+        # torch.distributed.all_gather(all_x, x)
+        # x = torch.cat(all_x, dim=-1)
+        # assert x.requires_grad
         # return x
-        return AllReduceComm.apply(x)
+
+        # to be implemented
+        pass
+
+    def __init__(self,
+                 vocab_size,
+                 embed_dim,
+                 hidden_dims,
+                 seq_length,
+                 num_classes,
+                 rank,
+                 world_size,
+                ):
+        super().__init__()
+        self.rank = rank
+        self.world_size = world_size
+        self.num_classes = num_classes
+        assert embed_dim % world_size == 0
+        embed_dim_per_rank = embed_dim // world_size
+        self.embedding = nn.Embedding(vocab_size, embed_dim_per_rank, device=f"cuda:{rank}")
+        hidden_layers = []
+        for fan_in_dim, fan_out_dim in zip([embed_dim * seq_length] + hidden_dims[:-1], hidden_dims):
+            assert fan_out_dim % world_size == 0
+            fan_out_dim_per_rank = fan_out_dim // world_size
+            hidden_layers.extend([
+                nn.Linear(fan_in_dim, fan_out_dim_per_rank, device=f"cuda:{rank}"),
+            ])
+        self.relus = nn.ModuleList([nn.ReLU()] * len(hidden_layers))
+        self.hidden_layers = nn.ModuleList(hidden_layers)
+        fc_fan_in_dim = hidden_dims[-1] if hidden_dims else embed_dim * seq_length
+        fc_fan_out_dim = (num_classes - 1) // world_size + 1
+        self.fc = nn.Linear(fc_fan_in_dim, fc_fan_out_dim, device=f"cuda:{rank}")
+
+    def forward(self, x):
+        loginfo(self.rank, f"input shape={x.shape}")
+        x = self.embedding(x)
+        assert x.requires_grad
+        loginfo(self.rank, f"embedding shape={x.shape}")
+        x = torch.reshape(x, x.shape[:-2] + (-1,))
+        assert x.requires_grad
+        loginfo(self.rank, f"concated shape={x.shape}")
+        for hidden_layer, relu in zip(self.hidden_layers, self.relus):
+            x = self.__class__.column_linear_comm(x)  # All gather
+            assert x.requires_grad
+            # x.shape == [..., H_in]
+            x = hidden_layer(x)
+            assert x.requires_grad
+            # x.shape == [..., H_out / W]
+            loginfo(self.rank, f"hidden layer shape={x.shape}")
+            x = relu(x)
+            assert x.requires_grad
+            loginfo(self.rank, f"relu output shape={x.shape}") 
+        loginfo(self.rank, f"last layer shape={x.shape}")
+        x = self.__class__.column_linear_comm(x)
+        assert x.requires_grad
+        x = self.fc(x)
+        assert x.requires_grad
+        loginfo(self.rank, f"output shape={x.shape}")
+        x = self.__class__.column_linear_comm(x)
+        assert x.requires_grad
+        logits = x[..., :self.num_classes]
+        assert logits.requires_grad
+        return logits
+        
 
 
 def train(
@@ -420,6 +532,7 @@ def tp_main_fn(
     category_size,
     train_input_tensor,
     train_label_tensor,
+    tp_model_cls,
 ):
     def loginfo(msg):
         t = datetime.datetime.now().strftime("%H:%M:%S.%f")
@@ -433,7 +546,7 @@ def tp_main_fn(
     
     torch.distributed.init_process_group(
         'nccl', rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=3))
-    model = TPMLPModel(
+    model = tp_model_cls(
         vocab_size=vocab_size,
         embed_dim=32,
         hidden_dims=[512],
@@ -585,14 +698,56 @@ def main(_):
         logging.info("Evaluating on test set:")
         eval(mlp_e32_512, test_input_tensor, test_label_tensor)
 
-
-    if True:
-        logging.info("----------- Tensor Parallel ------------")
+    if False:
+        logging.info("----------- Tensor Parallel Row Linear ------------")
         world_size = 4
         assert world_size <= torch.cuda.device_count()
         torch.multiprocessing.spawn(
             tp_main_fn,
-            args=(world_size, len(vocab), len(categories), train_input_tensor, train_label_tensor),
+            args=(
+                world_size,
+                len(vocab),
+                len(categories),
+                train_input_tensor,
+                train_label_tensor,
+                TPMLPModelWithDirectRowLinear,
+            ),
+            nprocs=world_size,
+            join=True,
+        )
+
+    if False:
+        logging.info("----------- Tensor Parallel Customized Row Linear ------------")
+        world_size = 4
+        assert world_size <= torch.cuda.device_count()
+        torch.multiprocessing.spawn(
+            tp_main_fn,
+            args=(
+                world_size,
+                len(vocab),
+                len(categories),
+                train_input_tensor,
+                train_label_tensor,
+                TPMLPModelWithCustomizedRowLinear,
+            ),
+            nprocs=world_size,
+            join=True,
+        )
+
+    if True:
+        logging.info("----------- Tensor Parallel Column Linear ------------")
+        world_size = 4
+        assert world_size <= torch.cuda.device_count()
+        torch.multiprocessing.spawn(
+            tp_main_fn,
+            args=(
+                world_size,
+                len(vocab),
+                len(categories),
+                train_input_tensor,
+                train_label_tensor,
+                TPMLPModelWithColumnLinear,
+            ),
             nprocs=world_size,
             join=True,
         )
